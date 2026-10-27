@@ -1,0 +1,125 @@
+name: Transparent Recording Fork Preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/transparent-live-recording
+
+permissions:
+  contents: write
+
+concurrency:
+  group: transparent-recording-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Transparent encoder selection tests
+        run: npx vitest run test/unit/electron/encoderCapabilities.test.ts
+      - name: Application typecheck
+        run: npm run typecheck
+
+  package:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+          - os: ubuntu-latest
+            label: linux-x64
+          - os: macos-latest
+            label: macos-universal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfuse2 rpm xvfb
+      - name: Install Rust
+        if: runner.os == 'Windows' || runner.os == 'Linux'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Prepare Windows wallpaper helper
+        if: runner.os == 'Windows'
+        run: npm run build:wallpaper-helper
+      - name: Prepare Linux wallpaper helper
+        if: runner.os == 'Linux'
+        run: npm run build:windowtolayer
+      - name: Run shared texture smoke probe (Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: xvfb-run -a npx electron electron/recording/probe/app.cjs
+      - name: Build renderer
+        env:
+          ELECTRON: 'true'
+          APP_VERSION_LABEL: Transparent Recording Preview
+          APP_RELEASE_CHANNEL: cielo
+        run: npm run build
+      - name: Package desktop application
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: transparent-recording-${{ matrix.label }}
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.deb
+            release/*.rpm
+            release/*.tar.gz
+            release/*.blockmap
+            release/*.yml
+            !release/builder-debug.yml
+          if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: transparent-recording-*
+          path: artifacts
+          merge-multiple: true
+      - name: Publish preview binaries to the fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'EOF'
+          Fork development preview for transparent live recording.
+
+          IMPORTANT: This is NOT yet the finished transparent recording product.
+          This preview validates codec capability infrastructure and the Electron
+          GPU shared-texture transfer proof-of-concept. Recording controls and
+          the production dual-output pipeline are still in development.
+
+          Every binary is built on GitHub Actions from this fork.
+          EOF
+          mapfile -d '' files < <(find artifacts -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.zip' -o -name '*.deb' -o -name '*.rpm' -o -name '*.tar.gz' \) -print0)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo 'No packaged binaries found' >&2
+            exit 1
+          fi
+          tag="transparent-recording-preview-${GITHUB_SHA:0:12}"
+          gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
+            --title "Transparent Recording Preview ${GITHUB_SHA:0:12}" \
+            --notes-file notes.md --target "$GITHUB_SHA" --prerelease
